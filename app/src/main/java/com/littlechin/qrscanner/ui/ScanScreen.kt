@@ -9,6 +9,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -17,6 +18,7 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -65,6 +67,7 @@ import com.littlechin.qrscanner.data.ScanRecord
 import com.littlechin.qrscanner.scanner.BarcodeAnalyzer
 import com.littlechin.qrscanner.scanner.formatName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -72,6 +75,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 
 /** 連續幾幀偵測到相同數量的條碼後觸發自動擷取，避免晃動時拍到模糊畫面。 */
@@ -188,6 +192,15 @@ private fun CameraContent(
     var isFrontCamera by remember { mutableStateOf(false) }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var zoomRatio by remember { mutableStateOf(1f) }
+    var focusPoint by remember { mutableStateOf<Offset?>(null) }
+
+    // 對焦指示圈顯示一小段時間後消失
+    LaunchedEffect(focusPoint) {
+        if (focusPoint != null) {
+            delay(900)
+            focusPoint = null
+        }
+    }
 
     LaunchedEffect(Unit) {
         val p = suspendCancellableCoroutine { cont ->
@@ -251,6 +264,23 @@ private fun CameraContent(
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
+                    detectTapGestures { offset ->
+                        val cam = camera ?: return@detectTapGestures
+                        // 把畫面座標轉成感光元件座標，對該點做 AF/AE
+                        val point = previewView.meteringPointFactory
+                            .createPoint(offset.x, offset.y)
+                        val action = FocusMeteringAction
+                            .Builder(
+                                point,
+                                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE,
+                            )
+                            .setAutoCancelDuration(4, TimeUnit.SECONDS)
+                            .build()
+                        cam.cameraControl.startFocusAndMetering(action)
+                        focusPoint = offset
+                    }
+                }
+                .pointerInput(Unit) {
                     detectTransformGestures { _, _, zoom, _ ->
                         val cam = camera ?: return@detectTransformGestures
                         val state = cam.cameraInfo.zoomState.value
@@ -281,6 +311,14 @@ private fun CameraContent(
                     topLeft = Offset(left, r.top * scale + dy),
                     size = Size(r.width() * scale, r.height() * scale),
                     style = Stroke(width = 4.dp.toPx()),
+                )
+            }
+            focusPoint?.let { p ->
+                drawCircle(
+                    color = Color.White,
+                    radius = 36.dp.toPx(),
+                    center = p,
+                    style = Stroke(width = 2.dp.toPx()),
                 )
             }
         }

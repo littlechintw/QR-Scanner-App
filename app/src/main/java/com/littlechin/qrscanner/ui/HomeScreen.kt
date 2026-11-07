@@ -1,5 +1,6 @@
 package com.littlechin.qrscanner.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +34,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -139,7 +141,23 @@ private fun SwipeToDeleteContainer(
                 false
             }
         },
+        positionalThreshold = { totalDistance -> totalDistance * 0.5f },
     )
+    // 滑超過一半（放開就會刪除）時背景變成鮮紅色，否則是灰色
+    val armed = dismissState.targetValue == SwipeToDismissBoxValue.EndToStart
+    val backgroundColor by animateColorAsState(
+        targetValue = if (armed) {
+            MaterialTheme.colorScheme.error
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        },
+        label = "swipeDeleteBackground",
+    )
+    val iconColor = if (armed) {
+        MaterialTheme.colorScheme.onError
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
     SwipeToDismissBox(
         state = dismissState,
         enableDismissFromStartToEnd = false,
@@ -148,13 +166,13 @@ private fun SwipeToDeleteContainer(
                 modifier = Modifier
                     .fillMaxSize()
                     .clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.errorContainer),
+                    .background(backgroundColor),
                 contentAlignment = Alignment.CenterEnd,
             ) {
                 Icon(
                     Icons.Default.Delete,
                     contentDescription = "刪除",
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    tint = iconColor,
                     modifier = Modifier.padding(end = 24.dp),
                 )
             }

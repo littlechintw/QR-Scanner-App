@@ -11,6 +11,9 @@ import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
@@ -213,7 +216,20 @@ private fun CameraContent(
         val preview = Preview.Builder().build().also {
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
+        // 預設分析解析度只有 640x480，扭曲（如圓柱面）或較小的條碼會解不出來。
+        // 拉高到 1600x1200 並維持 4:3，讓偵測框座標與預覽對齊。
         val analysis = ImageAnalysis.Builder()
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            android.util.Size(1600, 1200),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                        )
+                    )
+                    .build()
+            )
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
             .also { it.setAnalyzer(analysisExecutor, analyzer) }

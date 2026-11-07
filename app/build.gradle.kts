@@ -78,8 +78,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    // unbundled 版：模型由 Google Play services 提供，APK 不含 native 掃描函式庫
-    implementation("com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1")
+    // bundled 版：內建最新掃描模型（傾斜/扭曲容錯比 Play services 內的模型好）
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     val roomVersion = "2.6.1"
     implementation("androidx.room:room-runtime:$roomVersion")

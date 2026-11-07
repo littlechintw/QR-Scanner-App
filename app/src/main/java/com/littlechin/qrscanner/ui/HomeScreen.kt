@@ -1,7 +1,9 @@
 package com.littlechin.qrscanner.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,11 +24,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
@@ -99,16 +103,19 @@ fun HomeScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(records.value, key = { it.id }) { record ->
-                        RecordCard(
-                            record = record,
-                            onClick = { onOpenRecord(record.id) },
+                        SwipeToDeleteContainer(
                             onDelete = {
                                 scope.launch(Dispatchers.IO) {
                                     File(record.imagePath).delete()
                                     dao.delete(record)
                                 }
                             },
-                        )
+                        ) {
+                            RecordCard(
+                                record = record,
+                                onClick = { onOpenRecord(record.id) },
+                            )
+                        }
                     }
                 }
             }
@@ -119,10 +126,48 @@ fun HomeScreen(
 private val timeFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault())
 
 @Composable
+private fun SwipeToDeleteContainer(
+    onDelete: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val dismissState = rememberSwipeToDismissBoxState(
+        confirmValueChange = { value ->
+            if (value == SwipeToDismissBoxValue.EndToStart) {
+                onDelete()
+                true
+            } else {
+                false
+            }
+        },
+    )
+    SwipeToDismissBox(
+        state = dismissState,
+        enableDismissFromStartToEnd = false,
+        backgroundContent = {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.errorContainer),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "刪除",
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(end = 24.dp),
+                )
+            }
+        },
+    ) {
+        content()
+    }
+}
+
+@Composable
 private fun RecordCard(
     record: ScanRecord,
     onClick: () -> Unit,
-    onDelete: () -> Unit,
 ) {
     val codes = remember(record.codesJson) { record.codes }
     Card(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)) {
@@ -155,9 +200,6 @@ private fun RecordCard(
                         maxLines = 1,
                     )
                 }
-            }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Default.Delete, contentDescription = "刪除")
             }
             Icon(
                 Icons.AutoMirrored.Filled.ArrowForward,

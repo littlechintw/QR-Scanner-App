@@ -6,12 +6,15 @@ import android.graphics.Bitmap
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,6 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.Button
 import androidx.compose.material3.FloatingActionButton
@@ -44,6 +48,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.IntSize
@@ -58,8 +63,11 @@ import com.littlechin.qrscanner.scanner.BarcodeAnalyzer
 import com.littlechin.qrscanner.scanner.formatName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.max
 
@@ -170,35 +178,75 @@ private fun CameraContent(
         )
     }
 
+    val previewView = remember { PreviewView(context) }
+    var provider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var cameraInfos by remember { mutableStateOf<List<CameraInfo>>(emptyList()) }
+    var cameraIndex by remember { mutableStateOf(0) }
+    var isFrontCamera by remember { mutableStateOf(false) }
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var zoomRatio by remember { mutableStateOf(1f) }
+
+    LaunchedEffect(Unit) {
+        val p = suspendCancellableCoroutine { cont ->
+            val future = ProcessCameraProvider.getInstance(context)
+            future.addListener(
+                { cont.resume(future.get()) },
+                ContextCompat.getMainExecutor(context),
+            )
+        }
+        val infos = p.availableCameraInfos
+        val backIndex = infos.indexOfFirst { info ->
+            CameraSelector.DEFAULT_BACK_CAMERA.safeFilter(infos).contains(info)
+        }
+        cameraIndex = if (backIndex >= 0) backIndex else 0
+        cameraInfos = infos
+        provider = p
+    }
+
+    // 鏡頭切換時重新綁定
+    LaunchedEffect(provider, cameraIndex, cameraInfos) {
+        val p = provider ?: return@LaunchedEffect
+        val target = cameraInfos.getOrNull(cameraIndex) ?: return@LaunchedEffect
+        val selector = CameraSelector.Builder()
+            .addCameraFilter { infos -> infos.filter { it == target } }
+            .build()
+        val preview = Preview.Builder().build().also {
+            it.setSurfaceProvider(previewView.surfaceProvider)
+        }
+        val analysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+            .also { it.setAnalyzer(analysisExecutor, analyzer) }
+        p.unbindAll()
+        camera = p.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
+        zoomRatio = 1f
+        isFrontCamera = CameraSelector.DEFAULT_FRONT_CAMERA.safeFilter(cameraInfos).contains(target)
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
-            factory = { ctx ->
-                val previewView = PreviewView(ctx)
-                val providerFuture = ProcessCameraProvider.getInstance(ctx)
-                providerFuture.addListener({
-                    val provider = providerFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.setSurfaceProvider(previewView.surfaceProvider)
-                    }
-                    val analysis = ImageAnalysis.Builder()
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-                        .also { it.setAnalyzer(analysisExecutor, analyzer) }
-                    provider.unbindAll()
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis,
-                    )
-                }, ContextCompat.getMainExecutor(ctx))
-                previewView
-            },
+            factory = { previewView },
         )
 
         // 偵測框 overlay：把分析影像座標換算到 PreviewView（FILL_CENTER）座標
-        Canvas(modifier = Modifier.fillMaxSize()) {
+        // 前鏡頭預覽是鏡像的，x 座標要左右翻轉；同時在這層接收雙指縮放手勢
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, _, zoom, _ ->
+                        val cam = camera ?: return@detectTransformGestures
+                        val state = cam.cameraInfo.zoomState.value
+                        val newRatio = ((state?.zoomRatio ?: 1f) * zoom).coerceIn(
+                            state?.minZoomRatio ?: 1f,
+                            state?.maxZoomRatio ?: 1f,
+                        )
+                        cam.cameraControl.setZoomRatio(newRatio)
+                        zoomRatio = newRatio
+                    }
+                },
+        ) {
             if (imageSize.width == 0 || imageSize.height == 0) return@Canvas
             val scale = max(
                 size.width / imageSize.width,
@@ -207,9 +255,14 @@ private fun CameraContent(
             val dx = (size.width - imageSize.width * scale) / 2f
             val dy = (size.height - imageSize.height * scale) / 2f
             boxes.forEach { r ->
+                val left = if (isFrontCamera) {
+                    size.width - (r.right * scale + dx)
+                } else {
+                    r.left * scale + dx
+                }
                 drawRect(
                     color = Color(0xFF4CAF50),
-                    topLeft = Offset(r.left * scale + dx, r.top * scale + dy),
+                    topLeft = Offset(left, r.top * scale + dy),
                     size = Size(r.width() * scale, r.height() * scale),
                     style = Stroke(width = 4.dp.toPx()),
                 )
@@ -246,6 +299,23 @@ private fun CameraContent(
             )
         }
 
+        if (zoomRatio > 1.05f) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 72.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = Color.Black.copy(alpha = 0.6f),
+            ) {
+                Text(
+                    text = String.format(Locale.US, "%.1fx", zoomRatio),
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        }
+
         FloatingActionButton(
             onClick = {
                 if (boxes.isEmpty()) {
@@ -262,6 +332,47 @@ private fun CameraContent(
         ) {
             Icon(Icons.Default.PhotoCamera, contentDescription = "拍攝")
         }
+
+        if (cameraInfos.size > 1) {
+            FloatingActionButton(
+                onClick = {
+                    val next = (cameraIndex + 1) % cameraInfos.size
+                    cameraIndex = next
+                    Toast.makeText(
+                        context,
+                        "切換到${cameraLabel(cameraInfos, next)}",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 24.dp, bottom = 56.dp)
+                    .size(56.dp),
+                shape = CircleShape,
+                containerColor = Color.Black.copy(alpha = 0.6f),
+                contentColor = Color.White,
+            ) {
+                Icon(Icons.Default.Cameraswitch, contentDescription = "切換鏡頭")
+            }
+        }
+    }
+}
+
+private fun CameraSelector.safeFilter(infos: List<CameraInfo>): List<CameraInfo> =
+    try {
+        filter(infos)
+    } catch (e: IllegalArgumentException) {
+        emptyList()
+    }
+
+private fun cameraLabel(infos: List<CameraInfo>, index: Int): String {
+    val target = infos.getOrNull(index) ?: return "鏡頭"
+    val backs = CameraSelector.DEFAULT_BACK_CAMERA.safeFilter(infos)
+    val fronts = CameraSelector.DEFAULT_FRONT_CAMERA.safeFilter(infos)
+    return when {
+        target in backs -> "後鏡頭 ${backs.indexOf(target) + 1}/${backs.size}"
+        target in fronts -> "前鏡頭 ${fronts.indexOf(target) + 1}/${fronts.size}"
+        else -> "鏡頭 ${index + 1}/${infos.size}"
     }
 }
 

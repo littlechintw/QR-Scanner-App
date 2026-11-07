@@ -7,12 +7,12 @@ plugins {
 
 android {
     namespace = "com.littlechin.qrscanner"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.littlechin.qrscanner"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("VERSION_NAME") ?: "1.0.0"
     }
@@ -72,13 +72,14 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
 
-    val cameraxVersion = "1.3.4"
+    val cameraxVersion = "1.4.2"
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    // unbundled 版：模型由 Google Play services 提供，APK 不含 native 掃描函式庫
+    implementation("com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1")
 
     val roomVersion = "2.6.1"
     implementation("androidx.room:room-runtime:$roomVersion")

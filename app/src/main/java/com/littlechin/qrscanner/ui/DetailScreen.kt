@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -12,9 +13,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -49,6 +50,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.littlechin.qrscanner.data.CodeItem
 import com.littlechin.qrscanner.data.ScanDatabase
 import com.littlechin.qrscanner.data.ScanRecord
 import java.io.File
@@ -66,16 +68,26 @@ fun DetailScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
-    var record by remember { mutableStateOf<ScanRecord?>(null) }
+    // 單次掃描是一張截圖；連續掃描是同一個 session 的所有截圖
+    var frames by remember { mutableStateOf<List<ScanRecord>>(emptyList()) }
 
     LaunchedEffect(recordId) {
-        record = ScanDatabase.get(context).scanDao().byId(recordId)
+        val dao = ScanDatabase.get(context).scanDao()
+        val record = dao.byId(recordId)
+        val sessionId = record?.sessionId
+        frames = when {
+            record == null -> emptyList()
+            sessionId != null -> dao.bySession(sessionId)
+            else -> listOf(record)
+        }
     }
+
+    val continuous = frames.firstOrNull()?.sessionId != null
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("掃描結果") },
+                title = { Text(if (continuous) "連續掃描結果" else "掃描結果") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -84,87 +96,103 @@ fun DetailScreen(
             )
         },
     ) { padding ->
-        val r = record ?: return@Scaffold
-        val codes = remember(r.codesJson) { r.codes }
+        val first = frames.firstOrNull() ?: return@Scaffold
+        val frameCodes = remember(frames) { frames.map { it.codes } }
+        val total = frameCodes.sumOf { it.size }
 
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState()),
+                .padding(padding),
+            contentPadding = PaddingValues(16.dp),
         ) {
-            Text(
-                timeFormat.format(Date(r.timestamp)),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = 8.dp),
-            )
-
-            // 圖片 + 編號框 overlay
-            if (r.imageWidth > 0 && r.imageHeight > 0) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(r.imageWidth.toFloat() / r.imageHeight)
-                        .clip(RoundedCornerShape(12.dp)),
-                ) {
-                    AsyncImage(
-                        model = File(r.imagePath),
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
-                    )
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val scale = min(
-                            size.width / r.imageWidth,
-                            size.height / r.imageHeight,
-                        )
-                        val dx = (size.width - r.imageWidth * scale) / 2f
-                        val dy = (size.height - r.imageHeight * scale) / 2f
-                        codes.forEachIndexed { index, c ->
-                            val left = c.left * scale + dx
-                            val top = c.top * scale + dy
-                            drawRect(
-                                color = Color(0xFF4CAF50),
-                                topLeft = Offset(left, top),
-                                size = Size((c.right - c.left) * scale, (c.bottom - c.top) * scale),
-                                style = Stroke(width = 3.dp.toPx()),
-                            )
-                            // 編號圓點
-                            val radius = 12.dp.toPx()
-                            drawCircle(
-                                color = Color(0xFF4CAF50),
-                                radius = radius,
-                                center = Offset(left, top),
-                            )
-                            drawContext.canvas.nativeCanvas.drawText(
-                                "${index + 1}",
-                                left,
-                                top + radius / 2.5f,
-                                android.graphics.Paint().apply {
-                                    color = android.graphics.Color.WHITE
-                                    textSize = 13.sp.toPx()
-                                    textAlign = android.graphics.Paint.Align.CENTER
-                                    isFakeBoldText = true
-                                    isAntiAlias = true
-                                },
-                            )
-                        }
-                    }
-                }
+            item {
+                Text(
+                    timeFormat.format(Date(first.timestamp)),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "共 $total 個條碼",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
             }
 
-            Text(
-                "共 ${codes.size} 個條碼",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(vertical = 12.dp),
-            )
+            // 編號跨截圖連續：第二張圖的條碼接著第一張往下編
+            var offset = 0
+            frames.forEachIndexed { frameIndex, frame ->
+                val codes = frameCodes[frameIndex]
+                val startIndex = offset
+                offset += codes.size
+                item(key = "frame-${frame.id}") {
+                    FrameImage(frame = frame, codes = codes, startIndex = startIndex)
+                    Spacer(Modifier.padding(4.dp))
+                }
+                itemsIndexed(codes) { index, code ->
+                    CodeCard(index = startIndex + index, value = code.value, format = code.format)
+                    Spacer(Modifier.padding(4.dp))
+                }
+                if (frameIndex < frames.lastIndex) {
+                    item { Spacer(Modifier.padding(8.dp)) }
+                }
+            }
+        }
+    }
+}
 
-            codes.forEachIndexed { index, code ->
-                CodeCard(index = index, value = code.value, format = code.format)
-                Spacer(Modifier.padding(4.dp))
+/** 截圖 + 編號框 overlay。 */
+@Composable
+private fun FrameImage(frame: ScanRecord, codes: List<CodeItem>, startIndex: Int) {
+    if (frame.imageWidth <= 0 || frame.imageHeight <= 0) return
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(frame.imageWidth.toFloat() / frame.imageHeight)
+            .clip(RoundedCornerShape(12.dp)),
+    ) {
+        AsyncImage(
+            model = File(frame.imagePath),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit,
+        )
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val scale = min(
+                size.width / frame.imageWidth,
+                size.height / frame.imageHeight,
+            )
+            val dx = (size.width - frame.imageWidth * scale) / 2f
+            val dy = (size.height - frame.imageHeight * scale) / 2f
+            codes.forEachIndexed { index, c ->
+                val left = c.left * scale + dx
+                val top = c.top * scale + dy
+                drawRect(
+                    color = Color(0xFF4CAF50),
+                    topLeft = Offset(left, top),
+                    size = Size((c.right - c.left) * scale, (c.bottom - c.top) * scale),
+                    style = Stroke(width = 3.dp.toPx()),
+                )
+                // 編號圓點
+                val radius = 12.dp.toPx()
+                drawCircle(
+                    color = Color(0xFF4CAF50),
+                    radius = radius,
+                    center = Offset(left, top),
+                )
+                drawContext.canvas.nativeCanvas.drawText(
+                    "${startIndex + index + 1}",
+                    left,
+                    top + radius / 2.5f,
+                    android.graphics.Paint().apply {
+                        color = android.graphics.Color.WHITE
+                        textSize = 13.sp.toPx()
+                        textAlign = android.graphics.Paint.Align.CENTER
+                        isFakeBoldText = true
+                        isAntiAlias = true
+                    },
+                )
             }
         }
     }

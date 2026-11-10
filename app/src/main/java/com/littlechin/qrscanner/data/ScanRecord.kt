@@ -54,6 +54,8 @@ data class ScanRecord(
     val imageWidth: Int,
     val imageHeight: Int,
     val codesJson: String,
+    /** 連續掃描時，同一次掃描存下的每張截圖共用同一個 sessionId；單次掃描為 null。 */
+    val sessionId: Long? = null,
 ) {
     val codes: List<CodeItem>
         get() = CodeItem.listFromJson(codesJson)

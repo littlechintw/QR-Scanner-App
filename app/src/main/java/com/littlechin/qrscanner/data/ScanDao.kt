@@ -14,9 +14,15 @@ interface ScanDao {
     @Query("SELECT * FROM scans WHERE id = :id")
     suspend fun byId(id: Long): ScanRecord?
 
+    @Query("SELECT * FROM scans WHERE sessionId = :sessionId ORDER BY timestamp ASC, id ASC")
+    suspend fun bySession(sessionId: Long): List<ScanRecord>
+
     @Insert
     suspend fun insert(record: ScanRecord): Long
 
     @Delete
     suspend fun delete(record: ScanRecord)
+
+    @Delete
+    suspend fun deleteAll(records: List<ScanRecord>)
 }

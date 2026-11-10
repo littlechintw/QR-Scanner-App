@@ -37,11 +37,23 @@ fun AppNav() {
         composable("home") {
             HomeScreen(
                 onScan = { nav.navigate("scan") },
+                onContinuousScan = { nav.navigate("scan/continuous") },
                 onOpenRecord = { id -> nav.navigate("detail/$id") },
             )
         }
         composable("scan") {
             ScanScreen(
+                onSaved = { id ->
+                    nav.navigate("detail/$id") {
+                        popUpTo("home")
+                    }
+                },
+                onBack = { nav.popBackStack() },
+            )
+        }
+        composable("scan/continuous") {
+            ScanScreen(
+                continuous = true,
                 onSaved = { id ->
                     nav.navigate("detail/$id") {
                         popUpTo("home")

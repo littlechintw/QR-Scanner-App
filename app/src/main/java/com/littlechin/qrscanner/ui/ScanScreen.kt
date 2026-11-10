@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
@@ -31,7 +32,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.FlashlightOff
+import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -43,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,21 +58,27 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.barcode.common.Barcode
 import com.littlechin.qrscanner.data.CodeItem
 import com.littlechin.qrscanner.data.ScanDatabase
 import com.littlechin.qrscanner.data.ScanRecord
 import com.littlechin.qrscanner.scanner.BarcodeAnalyzer
+import com.littlechin.qrscanner.scanner.DetectedCode
 import com.littlechin.qrscanner.scanner.formatName
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -77,9 +88,13 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
+import kotlin.math.min
 
 /** 連續幾幀偵測到相同數量的條碼後觸發自動擷取，避免晃動時拍到模糊畫面。 */
 private const val STABLE_FRAMES = 5
+
+/** 自動變焦最多拉到幾倍；再往上多半是數位變焦，畫面晃動反而更難解。手動雙指縮放不受此限。 */
+private const val MAX_AUTO_ZOOM = 4f
 
 private class CaptureGate {
     private var consecutive = 0
@@ -112,8 +127,13 @@ private class CaptureGate {
     }
 }
 
+/**
+ * [continuous] 為 true 時是連續掃描：相機一直開著，每掃到一個沒看過的條碼就截圖存檔，
+ * 直到按停止（[onSaved] 帶其中一筆紀錄的 id）或返回（[onBack]）。
+ */
 @Composable
 fun ScanScreen(
+    continuous: Boolean = false,
     onSaved: (Long) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -133,7 +153,7 @@ fun ScanScreen(
     }
 
     if (hasPermission) {
-        CameraContent(onSaved = onSaved, onBack = onBack)
+        CameraContent(continuous = continuous, onSaved = onSaved, onBack = onBack)
     } else {
         Column(
             modifier = Modifier.fillMaxSize().padding(32.dp),
@@ -150,6 +170,7 @@ fun ScanScreen(
 
 @Composable
 private fun CameraContent(
+    continuous: Boolean,
     onSaved: (Long) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -159,30 +180,51 @@ private fun CameraContent(
     val dao = remember { ScanDatabase.get(context).scanDao() }
 
     var boxes by remember { mutableStateOf<List<android.graphics.Rect>>(emptyList()) }
+    // ML Kit 看到但解不出來（也還沒被二次增強救回來）的條碼位置
+    var undecodedBoxes by remember { mutableStateOf<List<android.graphics.Rect>>(emptyList()) }
     var imageSize by remember { mutableStateOf(IntSize.Zero) }
     var saving by remember { mutableStateOf(false) }
     val gate = remember { CaptureGate() }
+
+    // 連續掃描：這次掃描中已存過的條碼（格式＋內容），用來避免重複
+    val haptic = LocalHapticFeedback.current
+    val sessionId = remember { System.currentTimeMillis() }
+    val seenKeys = remember { HashSet<String>() }
+    val saveJobs = remember { ArrayList<Job>() }
+    var sessionCount by remember { mutableIntStateOf(0) }
+    var lastValue by remember { mutableStateOf<String?>(null) }
+    var firstRecordId by remember { mutableStateOf<Long?>(null) }
+    var stopping by remember { mutableStateOf(false) }
+
+    // 結束連續掃描：等還在寫入的截圖都存完再離開，才不會漏掉最後幾個
+    val finishSession: (Boolean) -> Unit = { showResult ->
+        if (!stopping) {
+            stopping = true
+            scope.launch {
+                saveJobs.toList().joinAll()
+                val id = firstRecordId
+                if (showResult && id != null) onSaved(id) else onBack()
+            }
+        }
+    }
+    val leave: () -> Unit = { if (continuous) finishSession(false) else onBack() }
+    BackHandler(enabled = continuous) { finishSession(false) }
+
+    val view = LocalView.current
+    DisposableEffect(continuous) {
+        if (continuous) view.keepScreenOn = true
+        onDispose { if (continuous) view.keepScreenOn = false }
+    }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    DisposableEffect(Unit) {
-        onDispose { analysisExecutor.shutdown() }
-    }
+    // 自動變焦的上限跟鏡頭有關，所以 analyzer 在每次綁定鏡頭時重建
+    val analyzerHolder = remember { arrayOfNulls<BarcodeAnalyzer>(1) }
 
-    val analyzer = remember {
-        BarcodeAnalyzer(
-            onFrame = { barcodes, w, h ->
-                boxes = barcodes.mapNotNull { it.boundingBox }
-                imageSize = IntSize(w, h)
-                gate.onFrame(barcodes.size)
-            },
-            onCapture = { bitmap, barcodes ->
-                saving = true
-                scope.launch(Dispatchers.IO) {
-                    val id = saveScan(context, dao, bitmap, barcodes)
-                    launch(Dispatchers.Main) { onSaved(id) }
-                }
-            },
-        )
+    DisposableEffect(Unit) {
+        onDispose {
+            analyzerHolder[0]?.close()
+            analysisExecutor.shutdown()
+        }
     }
 
     val previewView = remember { PreviewView(context) }
@@ -192,6 +234,7 @@ private fun CameraContent(
     var isFrontCamera by remember { mutableStateOf(false) }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var zoomRatio by remember { mutableStateOf(1f) }
+    var torchOn by remember { mutableStateOf(false) }
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
 
     // 對焦指示圈顯示一小段時間後消失
@@ -245,10 +288,59 @@ private fun CameraContent(
             )
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
-            .also { it.setAnalyzer(analysisExecutor, analyzer) }
         p.unbindAll()
+        analyzerHolder[0]?.close()
+        val analyzer = BarcodeAnalyzer(
+            maxZoomRatio = min(target.zoomState.value?.maxZoomRatio ?: 1f, MAX_AUTO_ZOOM),
+            onZoomSuggested = { ratio ->
+                // 條碼太小解不出來時 ML Kit 會建議拉近
+                val cam = camera
+                if (cam == null || gate.captured) {
+                    false
+                } else {
+                    cam.cameraControl.setZoomRatio(ratio)
+                    zoomRatio = ratio
+                    true
+                }
+            },
+            onFrame = { codes, undecoded, w, h ->
+                boxes = codes.mapNotNull { it.box }
+                undecodedBoxes = undecoded
+                imageSize = IntSize(w, h)
+                if (continuous) {
+                    // 這一幀有沒看過的條碼就截圖
+                    !stopping && codes.any { it.key() !in seenKeys }
+                } else {
+                    gate.onFrame(codes.size)
+                }
+            },
+            onCapture = { bitmap, codes ->
+                if (continuous) {
+                    // 只記這一幀新出現的條碼，已存過的不重複
+                    val fresh = codes.filter { seenKeys.add(it.key()) }
+                    if (fresh.isNotEmpty()) {
+                        sessionCount += fresh.size
+                        lastValue = fresh.last().value
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        saveJobs += scope.launch(Dispatchers.IO) {
+                            val id = saveScan(context, dao, bitmap, fresh, sessionId)
+                            if (firstRecordId == null) firstRecordId = id
+                        }
+                    }
+                } else {
+                    saving = true
+                    scope.launch(Dispatchers.IO) {
+                        val id = saveScan(context, dao, bitmap, codes, null)
+                        launch(Dispatchers.Main) { onSaved(id) }
+                    }
+                }
+            },
+        )
+        analyzerHolder[0] = analyzer
+        analysis.setAnalyzer(analysisExecutor, analyzer)
         camera = p.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
         zoomRatio = 1f
+        torchOn = false
         isFrontCamera = CameraSelector.DEFAULT_FRONT_CAMERA.safeFilter(cameraInfos).contains(target)
     }
 
@@ -300,18 +392,24 @@ private fun CameraContent(
             )
             val dx = (size.width - imageSize.width * scale) / 2f
             val dy = (size.height - imageSize.height * scale) / 2f
-            boxes.forEach { r ->
-                val left = if (isFrontCamera) {
-                    size.width - (r.right * scale + dx)
-                } else {
-                    r.left * scale + dx
+            // 綠框：已解出內容；橘框：看到了但還解不出來
+            listOf(
+                boxes to Color(0xFF4CAF50),
+                undecodedBoxes to Color(0xFFFF9800),
+            ).forEach { (rects, color) ->
+                rects.forEach { r ->
+                    val left = if (isFrontCamera) {
+                        size.width - (r.right * scale + dx)
+                    } else {
+                        r.left * scale + dx
+                    }
+                    drawRect(
+                        color = color,
+                        topLeft = Offset(left, r.top * scale + dy),
+                        size = Size(r.width() * scale, r.height() * scale),
+                        style = Stroke(width = 4.dp.toPx()),
+                    )
                 }
-                drawRect(
-                    color = Color(0xFF4CAF50),
-                    topLeft = Offset(left, r.top * scale + dy),
-                    size = Size(r.width() * scale, r.height() * scale),
-                    style = Stroke(width = 4.dp.toPx()),
-                )
             }
             focusPoint?.let { p ->
                 drawCircle(
@@ -324,7 +422,7 @@ private fun CameraContent(
         }
 
         IconButton(
-            onClick = onBack,
+            onClick = leave,
             modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
         ) {
             Icon(
@@ -337,27 +435,65 @@ private fun CameraContent(
         Surface(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 16.dp),
+                .padding(top = 16.dp, start = 56.dp, end = 56.dp),
             shape = RoundedCornerShape(24.dp),
             color = Color.Black.copy(alpha = 0.6f),
         ) {
-            Text(
-                text = when {
-                    saving -> "儲存中…"
-                    boxes.isEmpty() -> "將鏡頭對準 QR Code / 條碼"
-                    else -> "偵測到 ${boxes.size} 個條碼，保持穩定自動拍攝…"
-                },
-                color = Color.White,
+            Column(
                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
-                style = MaterialTheme.typography.bodyMedium,
-            )
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = when {
+                        saving || stopping -> "儲存中…"
+                        continuous -> "連續掃描中 · 已掃到 $sessionCount 個"
+                        boxes.isEmpty() && undecodedBoxes.isNotEmpty() ->
+                            "看到條碼但讀不出來，試著靠近、點一下對焦或開手電筒"
+                        boxes.isEmpty() -> "將鏡頭對準 QR Code / 條碼"
+                        else -> "偵測到 ${boxes.size} 個條碼，保持穩定自動拍攝…"
+                    },
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                // 連續掃描的第二行：讀不出來時給提示，否則顯示最新掃到的內容
+                val detail = when {
+                    !continuous -> null
+                    boxes.isEmpty() && undecodedBoxes.isNotEmpty() -> "看到條碼但讀不出來，試著靠近或對焦"
+                    else -> lastValue?.let { "最新：$it" }
+                }
+                if (detail != null) {
+                    Text(
+                        text = detail,
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+
+        if (camera?.cameraInfo?.hasFlashUnit() == true) {
+            IconButton(
+                onClick = {
+                    torchOn = !torchOn
+                    camera?.cameraControl?.enableTorch(torchOn)
+                },
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
+            ) {
+                Icon(
+                    if (torchOn) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
+                    contentDescription = if (torchOn) "關閉手電筒" else "開啟手電筒",
+                    tint = Color.White,
+                )
+            }
         }
 
         if (zoomRatio > 1.05f) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 72.dp),
+                    .padding(top = 88.dp),
                 shape = RoundedCornerShape(16.dp),
                 color = Color.Black.copy(alpha = 0.6f),
             ) {
@@ -370,21 +506,36 @@ private fun CameraContent(
             }
         }
 
-        FloatingActionButton(
-            onClick = {
-                if (boxes.isEmpty()) {
-                    Toast.makeText(context, "畫面中沒有偵測到條碼", Toast.LENGTH_SHORT).show()
-                } else {
-                    gate.manualRequest = true
-                }
-            },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 48.dp)
-                .size(72.dp),
-            shape = CircleShape,
-        ) {
-            Icon(Icons.Default.PhotoCamera, contentDescription = "拍攝")
+        if (continuous) {
+            FloatingActionButton(
+                onClick = { finishSession(true) },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 48.dp)
+                    .size(72.dp),
+                shape = CircleShape,
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            ) {
+                Icon(Icons.Default.Stop, contentDescription = "停止")
+            }
+        } else {
+            FloatingActionButton(
+                onClick = {
+                    if (boxes.isEmpty()) {
+                        Toast.makeText(context, "畫面中沒有偵測到條碼", Toast.LENGTH_SHORT).show()
+                    } else {
+                        gate.manualRequest = true
+                    }
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 48.dp)
+                    .size(72.dp),
+                shape = CircleShape,
+            ) {
+                Icon(Icons.Default.PhotoCamera, contentDescription = "拍攝")
+            }
         }
 
         if (cameraInfos.size > 1) {
@@ -430,22 +581,26 @@ private fun cameraLabel(infos: List<CameraInfo>, index: Int): String {
     }
 }
 
+/** 連續掃描判斷「是不是同一個條碼」用的鍵：格式＋內容。 */
+private fun DetectedCode.key(): String = "$format|$value"
+
 private suspend fun saveScan(
     context: android.content.Context,
     dao: com.littlechin.qrscanner.data.ScanDao,
     bitmap: Bitmap,
-    barcodes: List<Barcode>,
+    codes: List<DetectedCode>,
+    sessionId: Long?,
 ): Long {
     val dir = File(context.filesDir, "scans").apply { mkdirs() }
-    val file = File(dir, "scan_${System.currentTimeMillis()}.jpg")
+    val file = File(dir, "scan_${System.currentTimeMillis()}_${System.nanoTime()}.jpg")
     FileOutputStream(file).use { out ->
         bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
     }
-    val codes = barcodes.map { b ->
-        val box = b.boundingBox
+    val items = codes.map { c ->
+        val box = c.box
         CodeItem(
-            value = b.rawValue ?: b.displayValue ?: "",
-            format = formatName(b.format),
+            value = c.value,
+            format = formatName(c.format),
             left = box?.left ?: 0,
             top = box?.top ?: 0,
             right = box?.right ?: 0,
@@ -458,7 +613,8 @@ private suspend fun saveScan(
             imagePath = file.absolutePath,
             imageWidth = bitmap.width,
             imageHeight = bitmap.height,
-            codesJson = CodeItem.listToJson(codes),
+            codesJson = CodeItem.listToJson(items),
+            sessionId = sessionId,
         )
     )
 }

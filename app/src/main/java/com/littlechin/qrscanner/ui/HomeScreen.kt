@@ -21,11 +21,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
@@ -44,6 +46,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.littlechin.qrscanner.data.CodeItem
 import com.littlechin.qrscanner.data.ScanDatabase
 import com.littlechin.qrscanner.data.ScanRecord
 import kotlinx.coroutines.Dispatchers
@@ -57,12 +60,14 @@ import java.util.Locale
 @Composable
 fun HomeScreen(
     onScan: () -> Unit,
+    onContinuousScan: () -> Unit,
     onOpenRecord: (Long) -> Unit,
 ) {
     val context = LocalContext.current
     val dao = remember { ScanDatabase.get(context).scanDao() }
     val records = dao.all().collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
+    val entries = remember(records.value) { groupEntries(records.value) }
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("QR 掃描器") }) },
@@ -77,13 +82,26 @@ fun HomeScreen(
                 onClick = onScan,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 16.dp)
+                    .padding(top = 16.dp)
                     .height(64.dp),
                 shape = RoundedCornerShape(16.dp),
             ) {
                 Icon(Icons.Default.QrCodeScanner, contentDescription = null)
                 Spacer(Modifier.width(12.dp))
                 Text("開始掃描", style = MaterialTheme.typography.titleMedium)
+            }
+
+            OutlinedButton(
+                onClick = onContinuousScan,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp, bottom = 16.dp)
+                    .height(56.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Icon(Icons.Default.Repeat, contentDescription = null)
+                Spacer(Modifier.width(12.dp))
+                Text("連續掃描", style = MaterialTheme.typography.titleMedium)
             }
 
             Text(
@@ -93,7 +111,7 @@ fun HomeScreen(
                 modifier = Modifier.padding(bottom = 8.dp),
             )
 
-            if (records.value.isEmpty()) {
+            if (entries.isEmpty()) {
                 Text(
                     "還沒有任何紀錄，按上面的按鈕開始掃描吧！",
                     style = MaterialTheme.typography.bodyMedium,
@@ -104,18 +122,18 @@ fun HomeScreen(
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(records.value, key = { it.id }) { record ->
+                    items(entries, key = { it.key }) { entry ->
                         SwipeToDeleteContainer(
                             onDelete = {
                                 scope.launch(Dispatchers.IO) {
-                                    File(record.imagePath).delete()
-                                    dao.delete(record)
+                                    entry.records.forEach { File(it.imagePath).delete() }
+                                    dao.deleteAll(entry.records)
                                 }
                             },
                         ) {
                             RecordCard(
-                                record = record,
-                                onClick = { onOpenRecord(record.id) },
+                                entry = entry,
+                                onClick = { onOpenRecord(entry.records.first().id) },
                             )
                         }
                     }
@@ -123,6 +141,22 @@ fun HomeScreen(
             }
         }
     }
+}
+
+/** 首頁的一筆紀錄：單次掃描是一張截圖，連續掃描是同一個 session 的多張截圖（依時間先後）。 */
+private class HomeEntry(val key: String, val records: List<ScanRecord>) {
+    val continuous: Boolean get() = records.first().sessionId != null
+    val codes: List<CodeItem> = records.flatMap { it.codes }
+}
+
+/** [records] 依時間新到舊；連續掃描的截圖併成一筆，位置以最新的那張為準。 */
+private fun groupEntries(records: List<ScanRecord>): List<HomeEntry> {
+    val groups = LinkedHashMap<String, MutableList<ScanRecord>>()
+    for (r in records) {
+        val key = r.sessionId?.let { "s$it" } ?: "r${r.id}"
+        groups.getOrPut(key) { ArrayList() } += r
+    }
+    return groups.map { (key, list) -> HomeEntry(key, list.sortedWith(compareBy({ it.timestamp }, { it.id }))) }
 }
 
 private val timeFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault())
@@ -184,10 +218,11 @@ private fun SwipeToDeleteContainer(
 
 @Composable
 private fun RecordCard(
-    record: ScanRecord,
+    entry: HomeEntry,
     onClick: () -> Unit,
 ) {
-    val codes = remember(record.codesJson) { record.codes }
+    val record = entry.records.first()
+    val codes = entry.codes
     Card(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -208,7 +243,7 @@ private fun RecordCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "${codes.size} 個條碼",
+                    if (entry.continuous) "連續掃描 · ${codes.size} 個條碼" else "${codes.size} 個條碼",
                     style = MaterialTheme.typography.titleSmall,
                 )
                 codes.firstOrNull()?.let {
